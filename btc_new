@@ -1,0 +1,151 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+
+# CONFIG
+SYMBOL = "BTCUSDm"
+TIMEFRAME = mt5.TIMEFRAME_M5
+WMA_PERIOD = 60
+LOT_SIZE = 0.03
+TP_POINTS = 1000
+SL_POINTS = 1000
+SLEEP_SECONDS = 10  # Check every 10 seconds
+
+def calculate_wma(prices, period):
+    if len(prices) < period:
+        return None
+    weights = np.arange(1, period+1)
+    wma = np.sum(prices[-period:] * weights) / weights.sum()
+    return wma
+
+def get_latest_bars(symbol, timeframe, count):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        return None
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    return df
+
+def close_all_positions(symbol):
+    positions = mt5.positions_get(symbol=symbol)
+    if positions:
+        for pos in positions:
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos.ticket,
+                "symbol": symbol,
+                "volume": pos.volume,
+                "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": mt5.symbol_info_tick(symbol).ask if pos.type == mt5.POSITION_TYPE_BUY else mt5.symbol_info_tick(symbol).bid,
+                "deviation": 10,
+                "magic": 234000,
+                "comment": "Closing position",
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"Failed to close position #{pos.ticket}: {result.comment}")
+
+def open_position(symbol, order_type, volume, price, sl, tp):
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "deviation": 10,
+        "magic": 234000,
+        "comment": "WMA60 Strategy",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"Order failed: {result.comment}")
+        return False
+    print(f"Order placed successfully: {order_type}, ticket: {result.order}")
+    return True
+
+def main():
+    if not mt5.initialize():
+        print("MT5 initialization failed")
+        return
+
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if symbol_info is None:
+        print(f"Symbol {SYMBOL} not found")
+        mt5.shutdown()
+        return
+
+    point = symbol_info.point
+
+    last_signal = 0  # 1 for buy, -1 for sell, 0 no position
+
+    print("Starting live WMA60 strategy...")
+
+    while True:
+        df = get_latest_bars(SYMBOL, TIMEFRAME, WMA_PERIOD + 10)
+        if df is None:
+            print("Failed to get bars, retrying...")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
+        closes = df['close'].values
+        wma = calculate_wma(closes, WMA_PERIOD)
+        if wma is None:
+            print(f"Not enough data to calculate WMA{WMA_PERIOD}")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
+        current_price = closes[-1]
+        previous_price = closes[-2]
+
+        # Determine if price crossed WMA
+        crossed_up = (previous_price <= wma) and (current_price > wma)
+        crossed_down = (previous_price >= wma) and (current_price < wma)
+
+        positions = mt5.positions_get(symbol=SYMBOL)
+        has_position = positions is not None and len(positions) > 0
+
+        # If price crosses up and no position or short position -> close shorts and open buy
+        if crossed_up:
+            if has_position:
+                for pos in positions:
+                    if pos.type == mt5.POSITION_TYPE_SELL:
+                        print("Closing short position due to buy signal")
+                        close_all_positions(SYMBOL)
+                        has_position = False
+            if not has_position:
+                sl = current_price - SL_POINTS * point
+                tp = current_price + TP_POINTS * point
+                print(f"Opening BUY at {current_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_price, sl, tp)
+                last_signal = 1
+
+        # If price crosses down and no position or long position -> close longs and open sell
+        elif crossed_down:
+            if has_position:
+                for pos in positions:
+                    if pos.type == mt5.POSITION_TYPE_BUY:
+                        print("Closing long position due to sell signal")
+                        close_all_positions(SYMBOL)
+                        has_position = False
+            if not has_position:
+                sl = current_price + SL_POINTS * point
+                tp = current_price - TP_POINTS * point
+                print(f"Opening SELL at {current_price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_price, sl, tp)
+                last_signal = -1
+
+        else:
+            print(f"{datetime.now()} - No crossover detected. Price: {current_price:.2f}, WMA60: {wma:.2f}")
+
+        time.sleep(SLEEP_SECONDS)
+
+    mt5.shutdown()
+
+if __name__ == "__main__":
+    main()
