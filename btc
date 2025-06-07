@@ -1,0 +1,214 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import time
+from datetime import datetime
+
+# === CONFIG ===
+SYMBOL = "BTCUSDm"
+TIMEFRAME = mt5.TIMEFRAME_M5
+WMA_PERIOD = 60
+LOT_SIZE = 0.03
+TP_POINTS = 150  # Adjusted to be safe
+SL_POINTS = 150
+SLEEP_SECONDS = 30
+
+
+def calculate_wma(prices, period):
+    if len(prices) < period:
+        return None
+    weights = np.arange(1, period + 1)
+    return np.sum(prices[-period:] * weights) / weights.sum()
+
+
+def get_latest_bars(symbol, timeframe, count):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        return None
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    return df
+
+
+def close_all_positions(symbol):
+    positions = mt5.positions_get(symbol=symbol)
+    if positions:
+        for pos in positions:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                print(f"❌ Failed to get tick data for {symbol}")
+                continue
+
+            close_price = tick.ask if pos.type == mt5.POSITION_TYPE_BUY else tick.bid
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos.ticket,
+                "symbol": symbol,
+                "volume": pos.volume,
+                "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": close_price,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": "Closing position",
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"❌ Failed to close position #{pos.ticket}: {result.retcode} - {result.comment}")
+            else:
+                print(f"✅ Closed position #{pos.ticket}")
+
+
+def open_position(symbol, order_type, volume, current_price, sl, tp):
+    symbol_info = mt5.symbol_info(symbol)
+    if symbol_info is None:
+        print(f"❌ Symbol info not found for {symbol}")
+        return False
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        print(f"❌ Failed to get tick data for {symbol}")
+        return False
+
+    point = symbol_info.point
+    stop_level = symbol_info.stop_level
+    min_sl_tp_distance = stop_level * point
+
+    if order_type == mt5.ORDER_TYPE_BUY:
+        sl = tick.ask - SL_POINTS * point
+        tp = tick.ask + TP_POINTS * point
+        price = tick.ask
+    else:
+        sl = tick.bid + SL_POINTS * point
+        tp = tick.bid - TP_POINTS * point
+        price = tick.bid
+
+    # Check if SL/TP are valid
+    if abs(price - sl) < min_sl_tp_distance or abs(tp - price) < min_sl_tp_distance:
+        print(f"❌ SL/TP too close. Required minimum: {min_sl_tp_distance}, SL diff: {abs(price - sl)}, TP diff: {abs(tp - price)}")
+        return False
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "deviation": 20,
+        "magic": 234000,
+        "comment": "WMA60 Strategy",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"❌ Order failed: {result.retcode} => {result.comment}")
+        return False
+
+    print(f"✅ Order placed: {['BUY', 'SELL'][order_type == mt5.ORDER_TYPE_SELL]}, "
+          f"Price: {price:.2f}, SL: {sl:.2f}, TP: {tp:.2f}, Ticket: {result.order}")
+    return True
+
+
+def main():
+    if not mt5.initialize():
+        print("❌ MT5 initialization failed")
+        return
+
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if symbol_info is None:
+        print(f"❌ Symbol {SYMBOL} not found")
+        mt5.shutdown()
+        return
+
+    if not symbol_info.visible:
+        if not mt5.symbol_select(SYMBOL, True):
+            print(f"❌ Failed to add {SYMBOL} to Market Watch")
+            mt5.shutdown()
+            return
+
+    stop_level = getattr(symbol_info, 'stop_level', None)
+    if stop_level is None or stop_level == 0:
+        stop_level = getattr(symbol_info, 'trade_stops_level', None)
+
+    # If still None or zero, set a safe fallback manually (e.g., 50 points)
+    if stop_level is None or stop_level == 0:
+        print("⚠️ Using fallback stop level: 50")
+        stop_level = 10
+
+    print(f"✅ Trading started on {SYMBOL}, Point: {symbol_info.point}, StopLevel: {stop_level}")
+
+    prev_price = None
+    prev_wma = None
+
+    try:
+        while True:
+            df = get_latest_bars(SYMBOL, TIMEFRAME, WMA_PERIOD + 2)
+            if df is None:
+                print("❌ Failed to fetch candles")
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            closes = df['close'].values
+            wma = calculate_wma(closes, WMA_PERIOD)
+            if wma is None:
+                print("⏳ Not enough data to calculate WMA")
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            current_price = closes[-1]
+            previous_price = closes[-2]
+
+            crossed_up = (previous_price <= prev_wma) and (current_price > wma) if prev_wma is not None else False
+            crossed_down = (previous_price >= prev_wma) and (current_price < wma) if prev_wma is not None else False
+
+            positions = mt5.positions_get(symbol=SYMBOL)
+            has_position = positions and len(positions) > 0
+
+            if crossed_up:
+                print(f"🔼 BUY SIGNAL at {current_price:.2f}, WMA60: {wma:.2f}")
+                if has_position:
+                    for pos in positions:
+                        if pos.type == mt5.POSITION_TYPE_SELL:
+                            print("⚠️ Closing existing SELL before BUY")
+                            close_all_positions(SYMBOL)
+                            time.sleep(1)
+                            break
+                if not mt5.positions_total():
+                    open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_price, 0, 0)
+
+            elif crossed_down:
+                print(f"🔽 SELL SIGNAL at {current_price:.2f}, WMA60: {wma:.2f}")
+                if has_position:
+                    for pos in positions:
+                        if pos.type == mt5.POSITION_TYPE_BUY:
+                            print("⚠️ Closing existing BUY before SELL")
+                            close_all_positions(SYMBOL)
+                            time.sleep(1)
+                            break
+                if not mt5.positions_total():
+                    open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_price, 0, 0)
+
+            else:
+                print(f"{datetime.now().strftime('%H:%M:%S')} ⏸ No crossover | Price: {current_price:.2f} | WMA60: {wma:.2f}")
+
+            prev_price = current_price
+            prev_wma = wma
+
+            time.sleep(SLEEP_SECONDS)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Bot manually stopped by user.")
+    except Exception as e:
+        print(f"❌ Runtime Error: {e}")
+    finally:
+        print("📴 Shutting down MT5 connection...")
+        mt5.shutdown()
+
+
+if __name__ == "__main__":
+    main()
