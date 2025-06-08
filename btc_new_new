@@ -7,18 +7,17 @@ from datetime import datetime
 # CONFIG
 SYMBOL = "BTCUSDm"
 TIMEFRAME = mt5.TIMEFRAME_M15
-WMA_PERIOD = 60
+WMA_PERIOD = 5
 LOT_SIZE = 0.20
-TP_DOLLARS = 100
-SL_DOLLARS = 30
+TP_DOLLARS = 10000
+SL_DOLLARS = 4000
 SLEEP_SECONDS = 5  # check every 5 seconds
 
 def calculate_wma(prices, period):
     if len(prices) < period:
         return None
-    weights = np.arange(1, period+1)
-    wma = np.sum(prices[-period:] * weights) / weights.sum()
-    return wma
+    weights = np.arange(1, period + 1)
+    return np.sum(prices[-period:] * weights) / weights.sum()
 
 def get_latest_bars(symbol, timeframe, count):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
@@ -67,14 +66,14 @@ def open_position(symbol, order_type, volume, price, sl, tp):
         "tp": tp,
         "deviation": 10,
         "magic": 234000,
-        "comment": "WMA60 Strategy",
+        "comment": "WMA Strategy",
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
     result = mt5.order_send(request)
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         print(f"Order failed: {result.comment}")
         return False
-    print(f"Order placed successfully: {'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'}, ticket: {result.order}")
+    print(f"Order placed: {'BUY' if order_type == mt5.ORDER_TYPE_BUY else 'SELL'}, ticket: {result.order}")
     return True
 
 def main():
@@ -89,8 +88,9 @@ def main():
         return
 
     point = symbol_info.point
+    last_candle_time = None
 
-    print("Starting live WMA60 strategy with current ask/bid check...")
+    print("Starting WMA strategy with one-trade-per-candle control...")
 
     while True:
         df = get_latest_bars(SYMBOL, TIMEFRAME, WMA_PERIOD + 10)
@@ -99,23 +99,21 @@ def main():
             time.sleep(SLEEP_SECONDS)
             continue
 
+        # Get latest candle info
+        current_candle_time = df['time'].iloc[-1]
         closes = df['close'].values
         wma = calculate_wma(closes, WMA_PERIOD)
         if wma is None:
-            print(f"Not enough data to calculate WMA{WMA_PERIOD}")
+            print("Not enough data to calculate WMA")
             time.sleep(SLEEP_SECONDS)
             continue
 
         current_close = closes[-1]
         previous_close = closes[-2]
-
         current_ask, current_bid = get_tick_prices(SYMBOL)
 
-        # Crossover conditions on candle close price
         close_cross_up = (previous_close <= wma) and (current_close > wma)
         close_cross_down = (previous_close >= wma) and (current_close < wma)
-
-        # Additional ask/bid check on current tick prices
         ask_above_wma = current_ask > wma
         bid_below_wma = current_bid < wma
 
@@ -125,34 +123,42 @@ def main():
         buy_signal = close_cross_up and ask_above_wma
         sell_signal = close_cross_down and bid_below_wma
 
+        # Skip if still in same candle as last trade
+        if last_candle_time == current_candle_time:
+            print(f"{datetime.now()} - Skipping duplicate check in same candle: {current_candle_time}")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
         if buy_signal:
             if has_position:
                 for pos in positions:
                     if pos.type == mt5.POSITION_TYPE_SELL:
-                        print("Closing short position due to buy signal")
+                        print("Closing SELL due to BUY signal")
                         close_all_positions(SYMBOL)
                         has_position = False
             if not has_position:
                 sl = current_ask - SL_DOLLARS * point
                 tp = current_ask + TP_DOLLARS * point
-                print(f"{datetime.now()} - Opening BUY at {current_ask:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
-                open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_ask, sl, tp)
+                print(f"{datetime.now()} - BUY @ {current_ask:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                if open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_ask, sl, tp):
+                    last_candle_time = current_candle_time
 
         elif sell_signal:
             if has_position:
                 for pos in positions:
                     if pos.type == mt5.POSITION_TYPE_BUY:
-                        print("Closing long position due to sell signal")
+                        print("Closing BUY due to SELL signal")
                         close_all_positions(SYMBOL)
                         has_position = False
             if not has_position:
                 sl = current_bid + SL_DOLLARS * point
                 tp = current_bid - TP_DOLLARS * point
-                print(f"{datetime.now()} - Opening SELL at {current_bid:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
-                open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_bid, sl, tp)
+                print(f"{datetime.now()} - SELL @ {current_bid:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                if open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_bid, sl, tp):
+                    last_candle_time = current_candle_time
 
         else:
-            print(f"{datetime.now()} - No crossover detected. Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA60: {wma:.2f}")
+            print(f"{datetime.now()} - No signal | Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA: {wma:.2f}")
 
         time.sleep(SLEEP_SECONDS)
 
