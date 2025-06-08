@@ -15,8 +15,10 @@ CHECK_INTERVAL = 5  # seconds
 
 # === INITIALIZE MT5 ===
 if not mt5.initialize():
-    print("MT5 initialization failed")
+    print("❌ MT5 initialization failed:", mt5.last_error())
     quit()
+
+print("✅ MT5 Initialized. Starting strategy...")
 
 # === FUNCTION: Get Historical Candles + WMA ===
 def get_candles():
@@ -58,6 +60,7 @@ def place_order(direction):
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
+    print("🚀 Sending order...")
     result = mt5.order_send(request)
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         print(f"❌ Order failed: {result.retcode}")
@@ -84,6 +87,7 @@ def close_position(position):
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
+    print("🔁 Closing position...")
     result = mt5.order_send(request)
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         print(f"❌ Close failed: {result.retcode}")
@@ -93,33 +97,37 @@ def close_position(position):
 
 # === MAIN LOOP ===
 last_candle_time = None
+print("📡 Monitoring BTCUSDm every", CHECK_INTERVAL, "seconds...")
 
 while True:
     df = get_candles()
     ask, bid, current_price = get_prices()
 
     if df.shape[0] < WMA_PERIOD + 1 or df['wma'].isnull().any():
+        print("⏳ Not enough data or WMA not ready. Waiting...")
         time.sleep(CHECK_INTERVAL)
         continue
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Only act once per new candle
     if last_candle_time == curr['time']:
+        print("⏸ Same candle. Waiting for new one...")
         time.sleep(CHECK_INTERVAL)
         continue
 
-    # Fetch open position
+    print(f"\n🕒 New candle detected: {curr['time']}")
+    print(f"📈 WMA: {curr['wma']:.2f}, Close: {curr['close']:.2f}, Ask: {ask:.2f}, Bid: {bid:.2f}")
+
     positions = mt5.positions_get(symbol=SYMBOL)
     position = positions[0] if positions else None
 
-    # Entry Conditions
+    # === ENTRY CONDITIONS ===
     buy_signal = (current_price > curr['wma']) and (ask > curr['wma']) and (prev['close'] < prev['wma'])
     sell_signal = (current_price < curr['wma']) and (bid < curr['wma']) and (prev['close'] > prev['wma'])
+    print(f"🔍 Buy Signal: {buy_signal}, Sell Signal: {sell_signal}")
 
     if position:
-        # If opposite signal, close and reverse
         if position.type == mt5.ORDER_TYPE_BUY and sell_signal:
             close_position(position)
             time.sleep(1)
@@ -131,9 +139,7 @@ while True:
             time.sleep(1)
             place_order(mt5.ORDER_TYPE_BUY)
             last_candle_time = curr['time']
-
     else:
-        # No position, place fresh order
         if buy_signal:
             place_order(mt5.ORDER_TYPE_BUY)
             last_candle_time = curr['time']
