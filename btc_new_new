@@ -6,11 +6,11 @@ from datetime import datetime
 
 # CONFIG
 SYMBOL = "BTCUSDm"
-TIMEFRAME = mt5.TIMEFRAME_M15
+TIMEFRAME = mt5.TIMEFRAME_M15 
 WMA_PERIOD = 5
 LOT_SIZE = 0.20
 TP_DOLLARS = 10000
-SL_DOLLARS = 4000
+SL_DOLLARS = 5000
 SLEEP_SECONDS = 5  # check every 5 seconds
 
 def calculate_wma(prices, period):
@@ -89,8 +89,9 @@ def main():
 
     point = symbol_info.point
     last_candle_time = None
+    last_trade_direction = None  # 'BUY' or 'SELL'
 
-    print("Starting WMA strategy with one-trade-per-candle control...")
+    print("Starting WMA strategy with one-trade-per-candle and signal control...")
 
     while True:
         df = get_latest_bars(SYMBOL, TIMEFRAME, WMA_PERIOD + 10)
@@ -99,7 +100,6 @@ def main():
             time.sleep(SLEEP_SECONDS)
             continue
 
-        # Get latest candle info
         current_candle_time = df['time'].iloc[-1]
         closes = df['close'].values
         wma = calculate_wma(closes, WMA_PERIOD)
@@ -123,17 +123,16 @@ def main():
         buy_signal = close_cross_up and ask_above_wma
         sell_signal = close_cross_down and bid_below_wma
 
-        # Skip if still in same candle as last trade
         if last_candle_time == current_candle_time:
             print(f"{datetime.now()} - Skipping duplicate check in same candle: {current_candle_time}")
             time.sleep(SLEEP_SECONDS)
             continue
 
-        if buy_signal:
+        if buy_signal and last_trade_direction != 'BUY':
             if has_position:
                 for pos in positions:
                     if pos.type == mt5.POSITION_TYPE_SELL:
-                        print("Closing SELL due to BUY signal")
+                        print("Closing SELL due to new BUY signal")
                         close_all_positions(SYMBOL)
                         has_position = False
             if not has_position:
@@ -142,12 +141,12 @@ def main():
                 print(f"{datetime.now()} - BUY @ {current_ask:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
                 if open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_ask, sl, tp):
                     last_candle_time = current_candle_time
-
-        elif sell_signal:
+                    last_trade_direction = 'BUY'
+        elif sell_signal and last_trade_direction != 'SELL':
             if has_position:
                 for pos in positions:
                     if pos.type == mt5.POSITION_TYPE_BUY:
-                        print("Closing BUY due to SELL signal")
+                        print("Closing BUY due to new SELL signal")
                         close_all_positions(SYMBOL)
                         has_position = False
             if not has_position:
@@ -156,9 +155,9 @@ def main():
                 print(f"{datetime.now()} - SELL @ {current_bid:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
                 if open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_bid, sl, tp):
                     last_candle_time = current_candle_time
-
+                    last_trade_direction = 'SELL'
         else:
-            print(f"{datetime.now()} - No signal | Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA: {wma:.2f}")
+            print(f"{datetime.now()} - No new valid signal | Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA: {wma:.2f}")
 
         time.sleep(SLEEP_SECONDS)
 
