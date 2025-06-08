@@ -6,12 +6,13 @@ from datetime import datetime
 
 # CONFIG
 SYMBOL = "BTCUSDm"
-TIMEFRAME = mt5.TIMEFRAME_M15 
+TIMEFRAME = mt5.TIMEFRAME_M15
 WMA_PERIOD = 5
 LOT_SIZE = 0.20
 TP_DOLLARS = 10000
 SL_DOLLARS = 5000
-SLEEP_SECONDS = 5  # check every 5 seconds
+SLEEP_SECONDS = 5  # check interval
+IMMUNITY_SECONDS = 10  # time to wait after starting the bot
 
 def calculate_wma(prices, period):
     if len(prices) < period:
@@ -89,9 +90,10 @@ def main():
 
     point = symbol_info.point
     last_candle_time = None
-    last_trade_direction = None  # 'BUY' or 'SELL'
+    last_trade_direction = None
+    start_time = time.time()
 
-    print("Starting WMA strategy with one-trade-per-candle and signal control...")
+    print(f"{datetime.now()} - Starting bot with {IMMUNITY_SECONDS}s immunity...")
 
     while True:
         df = get_latest_bars(SYMBOL, TIMEFRAME, WMA_PERIOD + 10)
@@ -119,45 +121,64 @@ def main():
 
         positions = mt5.positions_get(symbol=SYMBOL)
         has_position = positions is not None and len(positions) > 0
-
         buy_signal = close_cross_up and ask_above_wma
         sell_signal = close_cross_down and bid_below_wma
 
-        if last_candle_time == current_candle_time:
-            print(f"{datetime.now()} - Skipping duplicate check in same candle: {current_candle_time}")
+        # IMMUNITY handling
+        if time.time() - start_time < IMMUNITY_SECONDS:
+            print(f"{datetime.now()} - In immunity period, monitoring only...")
+            time.sleep(SLEEP_SECONDS)
+            continue
+        elif last_candle_time is None:
+            last_candle_time = current_candle_time
+            print(f"{datetime.now()} - Immunity ended. Waiting for next candle to trade...")
             time.sleep(SLEEP_SECONDS)
             continue
 
-        if buy_signal and last_trade_direction != 'BUY':
-            if has_position:
-                for pos in positions:
-                    if pos.type == mt5.POSITION_TYPE_SELL:
-                        print("Closing SELL due to new BUY signal")
-                        close_all_positions(SYMBOL)
-                        has_position = False
-            if not has_position:
-                sl = current_ask - SL_DOLLARS * point
-                tp = current_ask + TP_DOLLARS * point
-                print(f"{datetime.now()} - BUY @ {current_ask:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
-                if open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_ask, sl, tp):
-                    last_candle_time = current_candle_time
-                    last_trade_direction = 'BUY'
-        elif sell_signal and last_trade_direction != 'SELL':
-            if has_position:
-                for pos in positions:
-                    if pos.type == mt5.POSITION_TYPE_BUY:
-                        print("Closing BUY due to new SELL signal")
-                        close_all_positions(SYMBOL)
-                        has_position = False
-            if not has_position:
-                sl = current_bid + SL_DOLLARS * point
-                tp = current_bid - TP_DOLLARS * point
-                print(f"{datetime.now()} - SELL @ {current_bid:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
-                if open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_bid, sl, tp):
-                    last_candle_time = current_candle_time
-                    last_trade_direction = 'SELL'
+        # Only act on new candle
+        if last_candle_time == current_candle_time:
+            print(f"{datetime.now()} - Same candle as last trade. Waiting...")
+            time.sleep(SLEEP_SECONDS)
+            continue
+
+        if buy_signal:
+            if last_trade_direction == "BUY":
+                print(f"{datetime.now()} - Already in BUY. Skipping.")
+            else:
+                if has_position:
+                    for pos in positions:
+                        if pos.type == mt5.POSITION_TYPE_SELL:
+                            print("Closing SELL due to BUY signal")
+                            close_all_positions(SYMBOL)
+                            has_position = False
+                if not has_position:
+                    sl = current_ask - SL_DOLLARS * point
+                    tp = current_ask + TP_DOLLARS * point
+                    print(f"{datetime.now()} - BUY @ {current_ask:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                    if open_position(SYMBOL, mt5.ORDER_TYPE_BUY, LOT_SIZE, current_ask, sl, tp):
+                        last_candle_time = current_candle_time
+                        last_trade_direction = "BUY"
+
+        elif sell_signal:
+            if last_trade_direction == "SELL":
+                print(f"{datetime.now()} - Already in SELL. Skipping.")
+            else:
+                if has_position:
+                    for pos in positions:
+                        if pos.type == mt5.POSITION_TYPE_BUY:
+                            print("Closing BUY due to SELL signal")
+                            close_all_positions(SYMBOL)
+                            has_position = False
+                if not has_position:
+                    sl = current_bid + SL_DOLLARS * point
+                    tp = current_bid - TP_DOLLARS * point
+                    print(f"{datetime.now()} - SELL @ {current_bid:.2f}, SL: {sl:.2f}, TP: {tp:.2f}")
+                    if open_position(SYMBOL, mt5.ORDER_TYPE_SELL, LOT_SIZE, current_bid, sl, tp):
+                        last_candle_time = current_candle_time
+                        last_trade_direction = "SELL"
+
         else:
-            print(f"{datetime.now()} - No new valid signal | Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA: {wma:.2f}")
+            print(f"{datetime.now()} - No signal | Close: {current_close:.2f}, Ask: {current_ask:.2f}, Bid: {current_bid:.2f}, WMA: {wma:.2f}")
 
         time.sleep(SLEEP_SECONDS)
 
